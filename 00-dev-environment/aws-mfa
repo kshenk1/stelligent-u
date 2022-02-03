@@ -2,6 +2,8 @@
 
 USER_MFA_TOKEN="$1"; shift
 
+set -u
+
 BLACK_B='\033[1;30m'
 RED_B='\033[1;31m'
 GREEN_B='\033[1;32m'
@@ -21,6 +23,7 @@ _TMP_FILE="/root/.aws/$_FNAME"
 _LOCAL_FILE="$HOME/.aws/$_FNAME"
 
 MASTER_SUFFIX="-master"
+M_PROFILE=""
 
 ## Docker image to use for the aws cli stuff
 AWS_CLI_IMAGE_NAME="amazon/aws-cli"
@@ -176,6 +179,7 @@ aws_config_set aws_secret_access_key $secret $CLI_PROFILE
 echo "Expires: $expiration"
 
 ## just for fun... find an output formatter if we can
+_formatter=""
 [[ -z "$_formatter" ]] && command -v yq >/dev/null 2>&1 && _formatter="yq eval -P"
 [[ -z "$_formatter" ]] && command -v jq >/dev/null 2>&1 && _formatter="jq"
 [[ -z "$_formatter" ]] && _formatter=">&1"
