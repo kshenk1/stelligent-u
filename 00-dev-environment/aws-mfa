@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+
+USER_MFA_TOKEN="$1"; shift
+
+BLACK_B='\033[1;30m'
+RED_B='\033[1;31m'
+GREEN_B='\033[1;32m'
+YELLOW_B='\033[1;33m'
+BLUE_B='\033[1;34m'
+PURPLE_B='\033[1;35m'
+PURPLE='\033[0;35m'
+CYAN_B='\033[1;36m'
+CYAN='\033[0;36m'
+WHITE_B='\033[1;37m'
+RESET='\033[0m'
+
+## tmp file stuff
+_FNAME_BASE="aws_mfa_auth"
+_FNAME="${_FNAME_BASE}_$(date "+%s")"
+_TMP_FILE="/root/.aws/$_FNAME"
+_LOCAL_FILE="$HOME/.aws/$_FNAME"
+
+MASTER_SUFFIX="-master"
+
+## Docker image to use for the aws cli stuff
+AWS_CLI_IMAGE_NAME="amazon/aws-cli"
+AWS_CLI_VERSION="2.2.11"
+AWS_CLI_IMAGE="$AWS_CLI_IMAGE_NAME:$AWS_CLI_VERSION"
+AWS_DEFAULT_REGION="us-east-2"
+
+function usage() {
+    echo -e "
+${WHITE_B}~~~~~~~~ ${CYAN_B}$(basename ${BASH_SOURCE[0]})${WHITE_B} ~~~~~~~~${RESET}
+
+  This runs the ${WHITE_B}aws cli${RESET} inside a docker container. The image currently in use
+  is: $AWS_CLI_IMAGE. Every command bind-mounts your ${YELLOW_B}$HOME/.aws${RESET} directory
+  into the running container at ${YELLOW_B}/root/.aws${RESET}.
+
+${WHITE_B}:: Profiles ::${RESET}
+  At the very least, you need one profile to exist suffixed with \"${PURPLE_B}${MASTER_SUFFIX}${RESET}\".
+  Example:
+  ${CYAN}[${CYAN_B}profile-1${MASTER_SUFFIX}${CYAN}]
+  aws_access_key_id = TH1SI5JU5T4N3XAMP1E
+  aws_secret_access_key = bigolelongstringofstuff/andthings${RESET}
+
+  In this case, we'll use this profile to create a new ${CYAN_B}profile-1${RESET} which can be used
+  in your normal aws calls: ${WHITE_B}aws --profile ${CYAN_B}profile-1${WHITE_B} ec2 etc-etc${RESET}
+
+${WHITE_B}:: Docker ::${RESET}
+  There are no aliases used or created in this script, just docker run commands using $AWS_CLI_IMAGE.
+  If you wish to continue running aws commands in the same docker image, you can use the following
+  alias to do some work for you:
+  ${CYAN_B}docker run --rm -i -v \$HOME/.aws:/root/.aws -v \$(pwd):/aws -w /aws ${AWS_CLI_IMAGE}${RESET}
+
+  ${WHITE_B}aws${RESET} commands would use the same ${YELLOW_B}~/.aws/{config,credentials}${RESET}, and your current
+  working directory is bind-mounted in as ${YELLOW_B}/aws${RESET} so you can easily work with files
+  from your local system.
+"
+}
+
+function aws_config_set() {
+    local key="$1"; shift
+    local val="$1"; shift
+    local profile="$1"; shift
+
+    docker run --rm -i \
+        -v $HOME/.aws:/root/.aws \
+        $AWS_CLI_IMAGE \
+        configure set $key $val --profile $profile
+    return $?
+}
+
+## Are we looking for help?
+echo "$USER_MFA_TOKEN" | egrep "[-]?(h|help)" >/dev/null 2>&1 && usage && exit 0
+
+## Figure out the current profile situation, and settle on one.
+declare -a master_profiles
+declare -a profiles=($(docker run --rm -i \
+    -v $HOME/.aws:/root/.aws \
+    $AWS_CLI_IMAGE \
+    configure list-profiles))
+
+## So, we're filtering out ones marked with the MASTER_SUFFIX because these
+## profiles we don't want to alter. 
+_re="\\${MASTER_SUFFIX}$"
+for p in ${profiles[@]}; do
+    [[ $p =~ $_re ]] && master_profiles[${#master_profiles[@]}]=$p
+done
+
+[[ "${#master_profiles[@]}" -eq 0 ]] && echo -e "${RED_B}ERROR${RESET}: No profiles found. You'll need at least one \"*${PURPLE_B}${MASTER_SUFFIX}${RESET}\"
+profile with your access key and secret key to get started" >&2 && exit 1
+
+[[ "${#master_profiles[@]}" -eq 1 ]] && M_PROFILE="${master_profiles[@]}"
+
+[[ "${#master_profiles[@]}" -gt 1 ]] && {
+    echo -e "\n${WHITE_B}Start by choosing a ${PURPLE_B}master${WHITE_B} profile (others not shown)\n"
+    counter=1
+    for mp in ${master_profiles[@]}; do
+        [[ $((counter % 2)) -eq 0 ]] && {
+            echo -e "  ${PURPLE_B}[${RESET}$counter${PURPLE_B}] $mp${RESET}"
+        } || {
+            echo -e "  ${PURPLE}[${RESET}$counter${PURPLE}] $mp${RESET}"
+        }
+        ((counter++))
+    done
+    echo
+
+    while [[ "$M_PROFILE" == "" ]]; do
+        echo -en "${WHITE_B} --> Enter the number for the profile to use: ${PURPLE_B}"
+        read num
+        echo -e "${RESET}"
+        ## subtract one to line up with 0-based index
+        ((num--))
+        M_PROFILE="${master_profiles[num]}"
+
+        [[ -z "$M_PROFILE" ]] && echo -e "${RED_B}ERROR${RESET}: You must chose a valid option." >&2
+    done
+}
+## remove the MASTER_SUFFIX
+CLI_PROFILE="$(echo "$M_PROFILE" | sed -e 's/'$_re'//')"
+echo -e "Using profile: ${CYAN}$M_PROFILE${RESET} to create ${CYAN_B}$CLI_PROFILE${RESET} for short-term access"
+
+# Check for existing Device ARN and prompt if not present
+mfa_arn="$(docker run --rm -i \
+    -v $HOME/.aws:/root/.aws \
+    $AWS_CLI_IMAGE \
+    --profile $M_PROFILE configure get mfa_serial)"
+
+[[ -z "$mfa_arn" ]] && echo "Please enter the MFA Device ARN. You can find this in the AWS Console (if you've configured MFA)."
+while [[ -z "$mfa_arn" ]]; do
+    echo -en "${WHITE_B} --> MFA Device ARN: ${PURPLE_B}"
+    read mfa_arn
+    echo -e "${RESET}"
+    case $mfa_arn in
+        "^arn:aws:iam:*") aws_config_set "mfa_serial" "$mfa_arn" "$M_PROFILE"; break ;;
+        * ) echo -e "${RED_B}ERROR${RESET}: Value incorrect, please input a valid AWS MFA ARN." >&2; break ;;
+    esac
+done
+
+while [[ -z "$USER_MFA_TOKEN" ]]; do
+    echo -en "${WHITE_B} --> Enter MFA Token: ${PURPLE_B}"
+    read USER_MFA_TOKEN
+    echo -e "${RESET}"
+    case $USER_MFA_TOKEN in
+        [0-9][0-9][0-9][0-9][0-9][0-9] ) break ;;
+        * ) echo -e "${RED_B}ERROR${RESET}: Please input a valid 6-digit pin" >&2 && continue ;;
+    esac
+done
+
+docker run --rm -it \
+    -v $HOME/.aws:/root/.aws \
+    --entrypoint bash \
+    $AWS_CLI_IMAGE \
+    -lc "aws sts get-session-token \
+        --serial-number $mfa_arn \
+        --token-code $USER_MFA_TOKEN \
+        --profile $M_PROFILE > $_TMP_FILE"
+
+## we look ok so far ?
+[[ "$?" -ne 0 ]] || [[ ! -f "$_LOCAL_FILE" ]] && {
+    echo -e "${RED_B}ERROR${RESET}: Unable to get session token" >&2 && exit 1
+}
+
+key_id="$(jq -r '.Credentials.AccessKeyId' $_LOCAL_FILE)"
+secret="$(jq -r '.Credentials.SecretAccessKey' $_LOCAL_FILE)"
+token="$(jq  -r '.Credentials.SessionToken' $_LOCAL_FILE)"
+expiration="$(jq  -r '.Credentials.Expiration' $_LOCAL_FILE)"
+
+## These are no longer needed...
+rm $HOME/.aws/${_FNAME_BASE}*
+
+aws_config_set aws_session_token     $token  $CLI_PROFILE
+aws_config_set aws_access_key_id     $key_id $CLI_PROFILE
+aws_config_set aws_secret_access_key $secret $CLI_PROFILE
+
+echo "Expires: $expiration"
+
+## just for fun... find an output formatter if we can
+[[ -z "$_formatter" ]] && command -v yq >/dev/null 2>&1 && _formatter="yq eval -P"
+[[ -z "$_formatter" ]] && command -v jq >/dev/null 2>&1 && _formatter="jq"
+[[ -z "$_formatter" ]] && _formatter=">&1"
+
+## Verify we are who we think we are... 
+docker run --rm -i \
+    -v $HOME/.aws:/root/.aws \
+    $AWS_CLI_IMAGE \
+    --profile $CLI_PROFILE sts get-caller-identity | eval $_formatter
+
+_ret=${PIPESTATUS[0]}
+
+echo -e "${WHITE_B}CLI Profile:${CYAN_B} $CLI_PROFILE${RESET}"
+
+exit $_ret
